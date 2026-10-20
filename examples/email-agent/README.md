@@ -1,203 +1,129 @@
-# Email Agent Example
+# Email Service Agent Example
 
-This example demonstrates how to build an email-processing agent using the email integration features in the agents framework.
+This example shows how to combine the new Cloudflare Email Service sending binding with Agents SDK email routing in one full-stack app.
 
-## Features
+## What this demonstrates
 
-- **Email Routing**: Routes emails to agents based on email addresses (e.g., `agent+id@domain.com`)
-- **Email Parsing**: Uses PostalMime to parse incoming emails
-- **Auto-Reply**: Automatically responds to incoming emails
-- **State Management**: Tracks email count and stores recent emails
-- **API Interface**: REST API for testing and management
+- Send transactional email from an agent with `this.sendEmail()`
+- Route inbound email into an agent with `routeAgentEmail()`
+- Parse MIME content with `postal-mime`
+- Optionally sign follow-up replies with `replyToEmail()` and `EMAIL_SECRET`
+- Keep inbox and outbox state synced to a React client with `useAgent()`
+- Simulate inbound email locally with `/api/simulate-email` before you deploy routing
 
-## Email Routing
+## Prerequisites
 
-The agent supports multiple routing strategies:
+Before running this example, you need:
 
-1. **Address-based routing**: Routes based on email address patterns
-2. **Header-based routing**: Uses `X-Agent-Name` and `X-Agent-ID` headers
-3. **Catch-all routing**: Routes all emails to a single agent
+1. **A domain onboarded to Cloudflare Email Service**
+   - Log in to the [Cloudflare Dashboard](https://dash.cloudflare.com)
+   - Navigate to **Compute & AI** > **Email Service**
+   - Select **Onboard Domain** and choose your domain
+   - Add the DNS records (SPF and DKIM) to authorize sending
 
-### Case Sensitivity Handling
+2. **A verified sender address** in the Cloudflare dashboard
+   - The example defaults to `mailbox-7f3a@example.com`
+   - Change `EMAIL_FROM` in `wrangler.jsonc` to your verified address
 
-The routing system automatically handles both CamelCase and kebab-case agent names:
+3. **DNS propagation** (usually 5-15 minutes, up to 24 hours)
 
-- Agent class `EmailAgent` is accessible as both `EmailAgent` and `email-agent`
-- This allows flexible email address formats while maintaining consistent routing
-
-## Setup
-
-1. Install dependencies:
-
-   ```bash
-   npm install
-   ```
-
-2. Start development server:
-
-   ```bash
-   npm start
-   ```
-
-3. Test email parsing locally:
-
-   ```bash
-   npm run test-email
-   ```
-
-4. Deploy to Cloudflare:
-   ```bash
-   npm run deploy
-   ```
-
-## Testing
-
-### Local Testing
-
-Run the email parsing test:
+## Running it
 
 ```bash
-npm run test-email
+npm install
+cp .env.example .env
+npm start
 ```
 
-This will test email creation, parsing, and routing logic without requiring a deployment.
+Before you send real email, review `wrangler.jsonc`:
 
-### API Testing
-
-Once the agent is running (dev or deployed), you can test with these endpoints:
-
-#### Get Agent Stats
+1. Update `vars.EMAIL_FROM` to your verified sender address
+2. Optional: add `EMAIL_SECRET` if you want signed reply routing:
 
 ```bash
-curl http://localhost:8787/api/stats/test123
+wrangler secret put EMAIL_SECRET
 ```
 
-#### Send Test Email (Simple API)
+The `send_email` binding is configured with `remote: true`, so `npm start` can call the real Email Service API from local development.
+
+If `EMAIL_SECRET` is missing, the example still runs. Inbound mail uses address-based routing only, and auto-replies are sent unsigned.
+
+### Common Errors
+
+| Error                    | Cause                         | Solution                                |
+| ------------------------ | ----------------------------- | --------------------------------------- |
+| `E_SENDER_NOT_VERIFIED`  | Domain or sender not verified | Complete domain onboarding in dashboard |
+| `E_RATE_LIMIT_EXCEEDED`  | Too many emails sent          | Wait and retry                          |
+| `E_DAILY_LIMIT_EXCEEDED` | Daily quota reached           | Wait for next day or upgrade plan       |
+
+## How to use it
+
+1. Open the app in your browser
+2. Use **Send outbound email** to send a real message through Email Service
+3. Use **Simulate inbound email** to exercise the inbound routing path locally
+4. Deploy the Worker and route `EMAIL_FROM` to it to receive live email
+
+## Key patterns
+
+### Send with sendEmail()
+
+```ts
+const response = await this.sendEmail({
+  binding: this.env.EMAIL,
+  to,
+  from: { email: this.env.EMAIL_FROM, name: "Email Service Agent" },
+  replyTo: this.env.EMAIL_FROM,
+  subject,
+  text: body,
+  html: body.replace(/\n/g, "<br />"),
+  secret: this.env.EMAIL_SECRET
+});
+```
+
+### Route inbound mail into the agent
+
+```ts
+const addressResolver = createAddressBasedEmailResolver("EmailServiceAgent");
+
+await routeAgentEmail(message, env, {
+  resolver: async (email, env) => {
+    if (env.EMAIL_SECRET) {
+      const secureResolver = createSecureReplyEmailResolver(env.EMAIL_SECRET);
+      const secureReply = await secureResolver(email, env);
+      if (secureReply) return secureReply;
+    }
+
+    return addressResolver(email, env);
+  }
+});
+```
+
+With `EMAIL_FROM="mailbox-7f3a@example.com"`, replies to `mailbox-7f3a@example.com` route to the `EmailServiceAgent` instance named `mailbox-7f3a`.
+
+## Local simulation endpoint
+
+The app includes a small HTTP helper so the example is still useful before you deploy routing:
 
 ```bash
-curl -X POST http://localhost:8787/api/test-email \
+curl -X POST http://localhost:8787/api/simulate-email \
   -H "Content-Type: application/json" \
   -d '{
-    "from": "user@example.com",
-    "to": "agent+test123@example.com",
-    "subject": "Test Email",
-    "body": "Hello from test!"
+    "from": "customer@example.com",
+    "subject": "Question about my account",
+    "body": "Can you confirm my renewal date?"
   }'
 ```
 
-### Real Email Testing
+That request creates a mock `ForwardableEmailMessage` and runs it through the same resolver chain as a real routed email.
 
-To test with real emails:
+## Deploying for real email
 
-1. Deploy the worker:
+1. Onboard your domain in Cloudflare Email Service for both sending and routing
+2. Verify the sender address used by `EMAIL_FROM`
+3. Deploy this Worker with `npm run deploy`
+4. Add an Email Service routing rule that sends `EMAIL_FROM` to this Worker
 
-   ```bash
-   npm run deploy
-   ```
+## Related docs
 
-2. Configure your domain's email routing to point to your worker
-
-- go to `https://dash.cloudflare.com/<account id>/<domain>/email/routing/routes`
-
-3. Send emails to addresses like:
-   - `support@yourdomain.com` (routes to EmailAgent with ID "support")
-   - `EmailAgent+urgent@yourdomain.com` (routes to EmailAgent with ID "urgent")
-
-## Email Routing Strategies
-
-### 1. Address-Based Routing
-
-```typescript
-// Routes based on email address patterns
-const resolver = createAddressBasedEmailResolver("EmailAgent");
-
-// How it works with the current EmailAgent implementation:
-// EmailAgent+user123@domain.com → { agentName: "EmailAgent", agentId: "user123" } ✅
-// john.doe@domain.com → { agentName: "EmailAgent", agentId: "john.doe" } ✅
-// support+urgent@domain.com → { agentName: "support", agentId: "urgent" } ❌ (no SupportAgent)
-```
-
-#### Address-Based Routing Rules
-
-For emails with **sub-addresses** (using `+`):
-
-- `localpart+subaddress@domain.com` → `{ agentName: "localpart", agentId: "subaddress" }`
-- Example: `EmailAgent+customer123@example.com` routes to agent `EmailAgent` with ID `customer123`
-
-For emails **without sub-addresses**:
-
-- `localpart@domain.com` → `{ agentName: defaultAgentName, agentId: "localpart" }`
-- Example: `support@example.com` with `createAddressBasedEmailResolver("EmailAgent")` routes to agent `EmailAgent` with ID `support`
-
-````
-
-### 2. Header-Based Routing
-
-```typescript
-// Routes based on custom header
-// Email with headers:
-//   X-Agent-Name: EmailAgent
-//   X-Agent-ID: customer-123
-// → routes to EmailAgent:customer-123
-````
-
-### 3. Catch-All Routing
-
-```typescript
-// Routes all emails to a single agent regardless of address
-const resolver = createCatchAllEmailResolver("EmailAgent", "main");
-
-// All emails route to EmailAgent:main
-// user@domain.com → EmailAgent:main
-// support@domain.com → EmailAgent:main
-// anything+test@domain.com → EmailAgent:main
-```
-
-## Agent Implementation
-
-The `EmailAgent` class demonstrates:
-
-- **Email Processing**: Parses emails with PostalMime
-- **State Management**: Tracks emails and statistics
-- **Auto-Reply**: Sends automated responses
-- **Loop Prevention**: Detects and prevents auto-reply loops
-
-```typescript
-class EmailAgent extends Agent<Env, EmailAgentState> {
-  async onEmail(email: AgentEmail) {
-    // Parse email content
-    const parsed = await PostalMime.parse(emailBuffer);
-
-    // Update agent state
-    this.setState({
-      emailCount: this.state.emailCount + 1,
-      emails: [...this.state.emails, emailData]
-    });
-
-    // Send auto-reply
-    await this.replyToEmail(email, {
-      from_name: "My Agent's name",
-      body: "Thank you for your email!"
-      // optionally set subject, headers, etc
-    });
-  }
-}
-```
-
-## Use Cases
-
-This EmailAgent example supports:
-
-1. **Unified Email Processing**: All emails route to the EmailAgent with different IDs based on address
-2. **Auto-Responders**: Automatically acknowledge receipt of emails
-3. **Email Parsing**: Email Processing: Parse and extract data from emails
-4. **Thread Management**: Maintain email conversation state
-5. **Multi-Instance Routing**: Route emails to different EmailAgent instances using email addresses
-
-## Next Steps
-
-- Add email templates for different types of auto-replies
-- Implement more sophisticated routing logic
-- Add email attachment processing
-- Integrate with external services (CRM, ticketing systems)
-- Add email scheduling and delayed sending
+- [`../../docs/agents/email.md`](../../docs/agents/email.md) — Email Service with agents
+- [`../playground`](../playground) — larger email routing demos inside the playground

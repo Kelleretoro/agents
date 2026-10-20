@@ -1,12 +1,8 @@
-import { env } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { expect } from "vitest";
-import worker, { type Env } from "../worker";
-import { MCPClientConnection } from "../../mcp/client-connection";
-
-declare module "cloudflare:test" {
-  interface ProvidedEnv extends Env {}
-}
+import worker from "../worker";
+import { MCPClientConnection } from "../../mcp/client/connection";
 
 /**
  * Common test messages for MCP protocol testing
@@ -17,7 +13,9 @@ export const TEST_MESSAGES = {
     jsonrpc: "2.0",
     method: "initialize",
     params: {
-      capabilities: {},
+      capabilities: {
+        elicitation: { form: {} }
+      },
       clientInfo: { name: "test-client", version: "1.0" },
       protocolVersion: "2025-03-26"
     }
@@ -139,13 +137,44 @@ export async function initializeStreamableHTTPServer(
 
 export async function initializeMCPClientConnection(
   baseUrl = "http://example.com/mcp",
-  transportType: "auto" | "streamable-http" | "sse" = "auto"
+  transportType: "auto" | "streamable-http" | "sse" | "rpc" = "auto",
+  transportOptions?: Record<string, unknown>
 ) {
   return new MCPClientConnection(
     new URL(baseUrl),
     { name: "test-client", version: "1.0.0" },
-    { transport: { type: transportType }, client: {} }
+    { transport: { type: transportType, ...transportOptions }, client: {} }
   );
+}
+
+/**
+ * Helper to create RPC connection to TestMcpAgent.
+ *
+ * Pass `elicitationHandlers` when the test exercises elicitation — without
+ * handlers the connection advertises no elicitation capability, so the server
+ * refuses to elicit.
+ */
+export async function establishRPCConnection(
+  elicitationHandlers?: MCPClientConnection["options"]["elicitationHandlers"]
+): Promise<{
+  connection: MCPClientConnection;
+  sessionId: string;
+}> {
+  const name = crypto.randomUUID();
+
+  const connection = new MCPClientConnection(
+    new URL(`rpc://${name}`),
+    { name: "test-client", version: "1.0.0" },
+    {
+      transport: { type: "rpc", namespace: env.MCP_OBJECT, name },
+      client: {},
+      elicitationHandlers
+    }
+  );
+
+  await connection.init();
+
+  return { connection, sessionId: `rpc:${name}` };
 }
 
 /**

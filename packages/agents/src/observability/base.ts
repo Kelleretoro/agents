@@ -3,22 +3,24 @@
  */
 export type BaseEvent<
   T extends string,
-  Payload extends Record<string, unknown> = {}
+  Payload extends Record<string, unknown> = Record<string, never>
 > = {
   type: T;
   /**
-   * The unique identifier for the event
+   * The class name of the agent that emitted this event
+   * (e.g. "MyChatAgent").
+   * Always present on events emitted by an Agent instance.
    */
-  id: string;
+  agent?: string;
   /**
-   * The message to display in the logs for this event, should the implementation choose to display
-   * a human-readable message.
+   * The instance name (Durable Object ID name) of the agent.
+   * Always present on events emitted by an Agent instance.
    */
-  displayMessage: string;
+  name?: string;
   /**
    * The payload of the event
    */
-  payload: Payload & Record<string, unknown>;
+  payload: Payload;
   /**
    * The timestamp of the event in milliseconds since epoch
    */

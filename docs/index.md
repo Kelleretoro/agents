@@ -1,23 +1,11 @@
-- get started
-- add to an existing project
-- routing
-- human in the loop
-- control flow
-- state
-- sync-engine
-- ai-sdk
-- tools
-- other stacks
-- http/ws
-- email
-- a/v
-- scheduling
-- queue
-- pause/resume
-- memory
-- evals
-- observability
-- connect anything
-- self hosting
-- how is this different from durable objects?
-- resources / read more
+# Cloudflare Agents SDK Documentation
+
+Documentation is grouped by the package that owns it:
+
+- [`agents`](./agents/index.md) — Durable Object agents, state, routing, scheduling, sessions, MCP, Voice, Channels, and shared primitives
+- [`@cloudflare/think`](./think/index.md) — opinionated agent harness built on Agents, Codemode, and [`@cloudflare/computer`](https://github.com/cloudflare/computer)
+- [`@cloudflare/codemode`](./codemode/index.md) — sandboxed code execution, tool providers, connectors, approvals, and snippets
+- [`@cloudflare/shell`](./shell/index.md) — deprecated; use `@cloudflare/computer`. See [Migrating to `@cloudflare/computer`](./shell/migrating-to-computer.md)
+- [`@cloudflare/voice`](./voice/index.md) — compatibility and migration guidance for the deprecated package
+
+Each package listed above includes its own documentation under `docs/`. Other published packages use their package README as their documentation entry point. Package indexes name relevant dependency documentation by package path, for example `agents/docs/index.md` or `@cloudflare/codemode/docs/index.md`.

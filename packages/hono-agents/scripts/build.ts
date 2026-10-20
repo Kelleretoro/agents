@@ -1,19 +1,22 @@
-import { execSync } from "node:child_process";
-import { build } from "tsup";
+import { build } from "tsdown";
+import { formatDeclarationFiles } from "../../../scripts/format-declarations";
 
 async function main() {
   await build({
     clean: true,
     dts: true,
     entry: ["src/*.ts", "src/*.tsx"],
-    external: ["cloudflare:workers", "cloudflare:email"],
+    deps: {
+      skipNodeModulesBundle: true,
+      neverBundle: ["cloudflare:workers", "cloudflare:email"]
+    },
     format: "esm",
     sourcemap: true,
-    splitting: true
+    fixedExtension: false
   });
 
-  // then run prettier on the generated .d.ts files
-  execSync("prettier --write ./dist/*.d.ts");
+  // then run oxfmt on the generated .d.ts files
+  formatDeclarationFiles();
 
   process.exit(0);
 }

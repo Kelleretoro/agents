@@ -1,222 +1,109 @@
-import { routeAgentRequest, Agent, callable, type Connection } from "agents";
-
-import { getSchedulePrompt } from "agents/schedule";
-
-import { experimental_codemode as codemode } from "agents/codemode/ai";
+import { routeAgentRequest, callable } from "agents";
+import { AIChatAgent } from "@cloudflare/ai-chat";
+import { createCodeTool, generateTypes } from "@cloudflare/codemode/ai";
+import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import {
   streamText,
-  type UIMessage,
-  stepCountIs,
+  isStepCount,
   convertToModelMessages,
-  type ToolSet,
-  readUIMessageStream,
-  generateId
+  pruneMessages
 } from "ai";
-import { openai } from "@ai-sdk/openai";
-import { tools } from "./tools";
-import { env } from "cloudflare:workers";
+import { createWorkersAI } from "workers-ai-provider";
+import { initDatabase, createTools } from "./tools";
 
-// export this WorkerEntryPoint that lets you
-// reroute function calls back to a caller
-export { CodeModeProxy } from "agents/codemode/ai";
-
-// inline this until enable_ctx_exports is supported by default
-declare global {
-  interface ExecutionContext<Props = unknown> {
-    readonly exports: Cloudflare.Exports;
-    readonly props: Props;
-  }
-
-  interface DurableObjectState<Props = unknown> {
-    readonly exports: Cloudflare.Exports;
-    readonly props: Props;
-  }
-}
-
-const model = openai("gpt-5");
-
-export const globalOutbound = {
-  fetch: async (
-    input: string | URL | RequestInfo,
-    init?: RequestInit<CfProperties<unknown>> | undefined
-  ): Promise<Response> => {
-    const url = new URL(
-      typeof input === "string"
-        ? input
-        : typeof input === "object" && "url" in input
-          ? input.url
-          : input.toString()
-    );
-    if (url.hostname === "example.com" && url.pathname === "/sub-path") {
-      return new Response("Not allowed", { status: 403 });
-    }
-    return fetch(input, init);
-  }
-};
-
-type State = {
-  messages: UIMessage<typeof tools>[];
-  loading: boolean;
-};
-
-export class Codemode extends Agent<Env, State> {
-  /**
-   * Handles incoming chat messages and manages the response stream
-   */
-  tools: ToolSet = {};
-
-  observability = undefined;
-
-  lastMessageRepliedTo: string | undefined;
-
-  initialState: State = {
-    messages: [],
-    loading: false
-  };
+export class Codemode extends AIChatAgent<Env> {
+  declare tools: ReturnType<typeof createTools>;
 
   async onStart() {
-    this.lastMessageRepliedTo =
-      this.state.messages[this.state.messages.length - 1]?.id;
-  }
+    initDatabase(this.ctx.storage.sql);
+    this.tools = createTools(this.ctx.storage.sql);
 
-  @callable({
-    description: "Add an MCP server to the agent"
-  })
-  addMcp({ name, url }: { name: string; url: string }) {
-    void this.addMcpServer(name, url, "http://localhost:5173")
-      .then(() => {
-        console.log("mcpServer added", name, url);
-      })
-      .catch((error) => {
-        console.error("mcpServer addition failed", error);
-      });
-  }
-
-  @callable({
-    description: "Remove an MCP server from the agent"
-  })
-  removeMcp(id: string) {
-    void this.removeMcpServer(id);
-  }
-
-  callTool(functionName: string, args: unknown[]) {
-    return this.tools[functionName]?.execute?.(args, {
-      abortSignal: new AbortController().signal,
-      toolCallId: "123",
-      messages: []
+    this.mcp.configureOAuthCallback({
+      customHandler: (result) => {
+        if (result.authSuccess) {
+          return new Response("<script>window.close();</script>", {
+            headers: { "content-type": "text/html" },
+            status: 200
+          });
+        }
+        return new Response(
+          `Authentication Failed: ${result.authError || "Unknown error"}`,
+          { headers: { "content-type": "text/plain" }, status: 400 }
+        );
+      }
     });
   }
 
-  async onStateUpdate(state: State, source: Connection | "server") {
-    if (source === "server") {
-      return;
-    }
-    if (
-      state.messages.length > 0 &&
-      this.lastMessageRepliedTo !==
-        state.messages[state.messages.length - 1]?.id
-    ) {
-      await this.onChatMessage();
-      this.lastMessageRepliedTo = state.messages[state.messages.length - 1]?.id;
-    }
+  @callable({ description: "Get tool type definitions" })
+  getToolTypes() {
+    const mcpTools = this.mcp.getAITools();
+    const allTools = { ...this.tools, ...mcpTools };
+    return generateTypes(allTools);
+  }
+
+  @callable({ description: "Add an MCP server to get additional tools" })
+  async addMcp(url: string, name?: string) {
+    const serverName = name || `mcp-${Date.now()}`;
+    const result = await this.addMcpServer(serverName, url);
+    return result;
+  }
+
+  @callable({ description: "List connected MCP servers and their tools" })
+  listMcpTools() {
+    const tools = this.mcp.listTools();
+    return tools.map((t) => ({
+      serverId: t.serverId,
+      name: t.name,
+      description: t.description
+    }));
+  }
+
+  @callable({ description: "Remove an MCP server" })
+  async removeMcp(serverId: string) {
+    await this.removeMcpServer(serverId);
+    return { success: true, removed: serverId };
   }
 
   async onChatMessage() {
-    // Collect all tools, including MCP tools
-    this.setState({ messages: this.state.messages, loading: true });
-    const allTools = {
-      ...tools,
-      ...this.mcp.getAITools()
-    };
+    const workersai = createWorkersAI({ binding: this.env.AI });
 
-    this.tools = allTools;
+    const executor = new DynamicWorkerExecutor({
+      loader: this.env.LOADER
+    });
 
-    const { prompt, tools: wrappedTools } = await codemode({
-      prompt: `You are a helpful assistant that can do various tasks... 
+    const mcpTools = this.mcp.getAITools();
+    const allTools = { ...this.tools, ...mcpTools };
 
-${getSchedulePrompt({ date: new Date() })}
-
-If the user asks to schedule a task, use the schedule tool to schedule the task.
-`,
+    const codemode = createCodeTool({
       tools: allTools,
-      globalOutbound: env.globalOutbound,
-      loader: env.LOADER,
-      proxy: this.ctx.exports.CodeModeProxy({
-        props: {
-          binding: "Codemode",
-          name: this.name,
-          callback: "callTool"
-        }
-      })
+      executor
     });
 
     const result = streamText({
-      system: prompt,
-
-      messages: convertToModelMessages(this.state.messages),
-      model,
-      // tools: allTools,
-      tools: wrappedTools,
-
-      onError: (error) => {
-        console.error("error", error);
-      },
-      // onFinish: ({response}) => {
-      //   this.setState({ messages: this.state.messages, loading: false });
-      // },
-
-      stopWhen: stepCountIs(10)
-    });
-
-    for await (const uiMessage of readUIMessageStream<UIMessage<typeof tools>>({
-      stream: result.toUIMessageStream({
-        generateMessageId: generateId
+      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
+        sessionAffinity: this.sessionAffinity
       }),
-      onError: (error) => {
-        console.error("error", error);
-      }
-    })) {
-      // console.log("Current message state:", uiMessage);
-      this.setState({
-        messages: updateMessages(this.state.messages, uiMessage),
-        loading: this.state.loading
-      });
-    }
-    this.setState({
-      messages: this.state.messages,
-      loading: false
+      instructions:
+        "You are a helpful project management assistant. " +
+        "You can create and manage projects, tasks, sprints, and comments using the codemode tool. " +
+        "When you need to perform operations, use the codemode tool to write JavaScript " +
+        "that calls the available functions on the `codemode` object.",
+      messages: pruneMessages({
+        messages: await convertToModelMessages(this.messages),
+        toolCalls: "before-last-2-messages",
+        reasoning: "before-last-message"
+      }),
+      tools: { codemode },
+      stopWhen: isStepCount(10)
     });
+
+    return result.toUIMessageStreamResponse();
   }
 }
 
-function updateMessages(
-  messages: UIMessage<typeof tools>[],
-  newMessage: UIMessage<typeof tools>
-) {
-  const finalMessages = [];
-  let updated = false;
-  for (const message of messages) {
-    if (message.id === newMessage.id) {
-      finalMessages.push(newMessage);
-      updated = true;
-    } else {
-      finalMessages.push(message);
-    }
-  }
-  if (!updated) {
-    finalMessages.push(newMessage);
-  }
-
-  return finalMessages;
-}
-
-/**
- * Worker entry point that routes incoming requests to the appropriate handler
- */
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext) {
     return (
-      // Route the request to our agent or return 404 if not found
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })
     );

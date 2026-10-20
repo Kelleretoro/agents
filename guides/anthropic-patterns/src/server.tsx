@@ -3,25 +3,12 @@
 import { type OpenAIProvider, createOpenAI } from "@ai-sdk/openai";
 import {
   Agent,
-  type AgentNamespace,
   type Connection,
   type WSMessage,
   routeAgentRequest
 } from "agents";
 import { generateObject, generateText } from "ai";
 import { z } from "zod";
-
-type Env = {
-  OPENAI_API_KEY: string;
-  AI_GATEWAY_TOKEN: string;
-  AI_GATEWAY_ACCOUNT_ID: string;
-  AI_GATEWAY_ID: string;
-  Sequential: AgentNamespace<Agent<Env>>;
-  Routing: AgentNamespace<Agent<Env>>;
-  Parallel: AgentNamespace<Agent<Env>>;
-  Orchestrator: AgentNamespace<Agent<Env>>;
-  Evaluator: AgentNamespace<Agent<Env>>;
-};
 
 // createAgent is a helper function to generate an agent class
 // with helpers for sending/receiving messages to the client and updating the status
@@ -46,9 +33,6 @@ function createAgent<
         "cf-aig-authorization": `Bearer ${this.env.AI_GATEWAY_TOKEN}`
       }
     });
-    static options = {
-      hibernate: true
-    };
     status: {
       isRunning: boolean;
       output: string | undefined;
@@ -218,7 +202,7 @@ export const Routing = createAgent<{ query: string }, { response: string }>(
           ? ctx.openai("gpt-4o-mini")
           : ctx.openai("o1-mini"),
       prompt: props.query,
-      system: {
+      instructions: {
         general:
           "You are an expert customer service agent handling general inquiries.",
         refund:
@@ -258,7 +242,7 @@ export const Parallel = createAgent<
             suggestions: z.array(z.string()),
             vulnerabilities: z.array(z.string())
           }),
-          system:
+          instructions:
             "You are an expert in code security. Focus on identifying security vulnerabilities, injection risks, and authentication issues."
         }),
 
@@ -271,7 +255,7 @@ export const Parallel = createAgent<
             issues: z.array(z.string()),
             optimizations: z.array(z.string())
           }),
-          system:
+          instructions:
             "You are an expert in code performance. Focus on identifying performance bottlenecks, memory leaks, and optimization opportunities."
         }),
 
@@ -284,7 +268,7 @@ export const Parallel = createAgent<
             qualityScore: z.number().min(1).max(10),
             recommendations: z.array(z.string())
           }),
-          system:
+          instructions:
             "You are an expert in code quality. Focus on code structure, readability, and adherence to best practices."
         })
       ]);
@@ -302,7 +286,8 @@ export const Parallel = createAgent<
       model,
       prompt: `Synthesize these code review results into a concise summary with key actions:
     ${JSON.stringify(reviews, null, 2)}`,
-      system: "You are a technical lead summarizing multiple code reviews."
+      instructions:
+        "You are a technical lead summarizing multiple code reviews."
     });
 
     ctx.toast("Code review summary complete");
@@ -349,7 +334,7 @@ export const Orchestrator = createAgent<
           })
         )
       }),
-      system:
+      instructions:
         "You are a senior software architect planning feature implementations."
     });
     ctx.toast("Implementation plan created");
@@ -377,7 +362,7 @@ export const Orchestrator = createAgent<
             code: z.string(),
             explanation: z.string()
           }),
-          system: workerSystemPrompt
+          instructions: workerSystemPrompt
         });
         ctx.toast("File change implemented");
         return {
@@ -413,7 +398,7 @@ export const Evaluator = createAgent(
       model: ctx.openai("gpt-4o-mini"), // use small model for first attempt
       prompt: `Translate this text to ${props.targetLanguage}, preserving tone and cultural nuances:
       ${props.text}`,
-      system: "You are an expert literary translator."
+      instructions: "You are an expert literary translator."
     });
 
     ctx.toast("Initial translation complete");
@@ -443,7 +428,7 @@ export const Evaluator = createAgent(
           qualityScore: z.number().min(1).max(10),
           specificIssues: z.array(z.string())
         }),
-        system: "You are an expert in evaluating literary translations."
+        instructions: "You are an expert in evaluating literary translations."
       });
 
       ctx.toast(`Evaluation complete: ${evaluation.qualityScore}`);
@@ -467,7 +452,7 @@ export const Evaluator = createAgent(
   
         Original: ${props.text}
         Current Translation: ${currentTranslation}`,
-        system: "You are an expert literary translator."
+        instructions: "You are an expert literary translator."
       });
 
       ctx.toast("Improved translation complete");

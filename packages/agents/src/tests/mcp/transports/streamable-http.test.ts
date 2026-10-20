@@ -1,13 +1,17 @@
-import { createExecutionContext, env } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { createExecutionContext } from "cloudflare:test";
 import type {
   CallToolResult,
   JSONRPCMessage,
   ListToolsResult,
   JSONRPCNotification,
-  JSONRPCResponse
+  JSONRPCResultResponse
 } from "@modelcontextprotocol/sdk/types.js";
-import { describe, expect, it } from "vitest";
-import worker, { type Env } from "../../worker";
+import type { Connection } from "../../../lifecycle/types";
+import { describe, expect, it, vi } from "vitest";
+import { __DO_NOT_USE_WILL_BREAK__agentContext as agentContext } from "../../../internal_context";
+import { StreamableHTTPServerTransport } from "../../../mcp/server/transport";
+import worker from "../../worker";
 import {
   TEST_MESSAGES,
   initializeStreamableHTTPServer,
@@ -19,10 +23,6 @@ import {
   parseSSEData,
   expectValidToolsList
 } from "../../shared/test-utils";
-
-declare module "cloudflare:test" {
-  interface ProvidedEnv extends Env {}
-}
 
 // small helper to read one full SSE frame from a reader
 async function readOneFrame(
@@ -224,6 +224,46 @@ describe("Streamable HTTP Transport", () => {
         jsonrpc: "2.0"
       });
     });
+
+    it("should accept JSON payloads containing Unicode characters", async () => {
+      const ctx = createExecutionContext();
+      const sessionId = await initializeStreamableHTTPServer(ctx);
+
+      const unicodeName = "José’s Café";
+      const unicodeRequest: JSONRPCMessage[] = [
+        {
+          id: "unicode-1",
+          jsonrpc: "2.0",
+          method: "tools/call",
+          params: {
+            name: "greet",
+            arguments: {
+              name: unicodeName
+            }
+          }
+        }
+      ];
+
+      const response = await sendPostRequest(
+        ctx,
+        baseUrl,
+        unicodeRequest,
+        sessionId
+      );
+
+      expect(response.status).toBe(200);
+
+      const sseText = await readSSEEvent(response);
+      const parsed = parseSSEData(sseText) as JSONRPCResultResponse;
+      expect(parsed.id).toBe("unicode-1");
+
+      const result = parsed.result as CallToolResult;
+      expect(result.content).toBeDefined();
+      expect(
+        result.content?.[0]?.type === "text" &&
+          result.content?.[0]?.text === `Hello, ${unicodeName}!`
+      ).toBe(true);
+    });
   });
 
   describe("Batch Operations", () => {
@@ -306,6 +346,8 @@ describe("Streamable HTTP Transport", () => {
       expect(combinedText).toContain('"tools"');
       expect(combinedText).toContain('"id":"req-2"');
       expect(combinedText).toContain("Hello, BatchUser");
+
+      await reader?.cancel();
     });
   });
 
@@ -348,6 +390,164 @@ describe("Streamable HTTP Transport", () => {
       const text2 = new TextDecoder().decode(value2);
       expect(text2).toContain('"id":"req-2"');
       expect(text2).toContain("Hello, Connection2");
+
+      await reader1?.cancel();
+      await reader2?.cancel();
+    });
+
+    it("keeps colliding request ids on their originating POST streams", async () => {
+      const ctx = createExecutionContext();
+      const sessionId = await initializeStreamableHTTPServer(ctx);
+      const collidingRequest = (label: string): JSONRPCMessage => ({
+        id: "same-id",
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: {
+          arguments: { label },
+          name: "collisionBarrierEcho"
+        }
+      });
+
+      const [responseA, responseB] = await Promise.all([
+        sendPostRequest(ctx, baseUrl, collidingRequest("A"), sessionId),
+        sendPostRequest(ctx, baseUrl, collidingRequest("B"), sessionId)
+      ]);
+      const readerA = responseA.body?.getReader();
+      const readerB = responseB.body?.getReader();
+      expect(readerA).toBeTruthy();
+      expect(readerB).toBeTruthy();
+      if (!readerA || !readerB) throw new Error("No POST stream reader");
+
+      const [frameA, frameB] = await Promise.all([
+        readSSEEventWithTimeout(readerA, 1000),
+        readSSEEventWithTimeout(readerB, 1000)
+      ]);
+
+      expect(frameA).not.toBeNull();
+      expect(frameB).not.toBeNull();
+      expect(frameA).toContain("collision:A");
+      expect(frameB).toContain("collision:B");
+
+      await readerA.cancel();
+      await readerB.cancel();
+    });
+  });
+
+  describe("Ambiguous request id routing", () => {
+    const createConnection = (
+      id: string,
+      requestIds: string[] = ["same-id"]
+    ) => ({
+      id,
+      state: { streamId: id, requestIds },
+      send: vi.fn()
+    });
+
+    const createTransport = (
+      liveConnections: ReturnType<typeof createConnection>[]
+    ) => {
+      const agent = {
+        deleteStreamRequestIds: vi.fn(async () => undefined),
+        getConnections: () => liveConnections,
+        getSessionId: () => "session-id"
+      };
+      const transport = agentContext.run(
+        {
+          agent,
+          connection: undefined,
+          email: undefined,
+          request: undefined
+        },
+        () => new StreamableHTTPServerTransport({})
+      );
+      return { agent, transport };
+    };
+
+    const result = {
+      id: "same-id",
+      jsonrpc: "2.0" as const,
+      result: { content: "right response" }
+    };
+
+    it("returns internal errors to duplicate live streams when no origin is available", async () => {
+      const first = createConnection("first");
+      const second = createConnection("second");
+      const { agent, transport } = createTransport([first, second]);
+
+      await agentContext.run(
+        {
+          agent,
+          connection: undefined,
+          email: undefined,
+          request: undefined
+        },
+        () => transport.send(result)
+      );
+
+      for (const connection of [first, second]) {
+        expect(connection.send).toHaveBeenCalledOnce();
+        const event = JSON.parse(String(connection.send.mock.calls[0][0])) as {
+          event: string;
+          close?: boolean;
+        };
+        const error = parseSSEData(event.event) as {
+          error: { code: number; message: string };
+          id: string;
+        };
+        expect(error).toMatchObject({
+          error: { code: -32603, message: "Internal error" },
+          id: "same-id"
+        });
+        expect(event.event).not.toContain("right response");
+        expect(event.close).toBe(true);
+      }
+    });
+
+    it("routes to a live resumed stream instead of a stale originating stream", async () => {
+      const staleOrigin = createConnection("closed-post");
+      const resumed = createConnection("resumed-get");
+      const { agent, transport } = createTransport([resumed]);
+
+      await agentContext.run(
+        {
+          agent,
+          connection: staleOrigin as unknown as Connection,
+          email: undefined,
+          request: undefined
+        },
+        () => transport.send(result)
+      );
+
+      expect(staleOrigin.send).not.toHaveBeenCalled();
+      expect(resumed.send).toHaveBeenCalledOnce();
+    });
+
+    it("tracks colliding batch response completion independently per stream", async () => {
+      const batch = createConnection("batch", ["same-id", "batch-only"]);
+      const colliding = createConnection("colliding");
+      const { agent, transport } = createTransport([batch, colliding]);
+      const sendFrom = (
+        connection: ReturnType<typeof createConnection>,
+        id: string
+      ) =>
+        agentContext.run(
+          {
+            agent,
+            connection: connection as unknown as Connection,
+            email: undefined,
+            request: undefined
+          },
+          () => transport.send({ ...result, id })
+        );
+
+      await sendFrom(batch, "same-id");
+      await sendFrom(colliding, "same-id");
+      await sendFrom(batch, "batch-only");
+
+      const finalBatchEvent = JSON.parse(
+        String(batch.send.mock.calls.at(-1)?.[0])
+      ) as { close?: boolean };
+      expect(finalBatchEvent.close).toBe(true);
     });
   });
 
@@ -365,6 +565,8 @@ describe("Streamable HTTP Transport", () => {
       // Control frame is internal and not forwarded, no events should be sent.
       const maybe = await readSSEEventWithTimeout(reader, 50);
       expect(maybe).toBeNull();
+
+      await reader.cancel();
     });
 
     it("should continue routing POST responses to their own SSE streams even when standalone SSE is open", async () => {
@@ -391,6 +593,8 @@ describe("Streamable HTTP Transport", () => {
       // Ensure the standalone stream did NOT get anything
       const maybe = await readSSEEventWithTimeout(standaloneReader, 50);
       expect(maybe).toBeNull();
+
+      await standaloneReader.cancel();
     });
 
     it("should deliver logging/message on the standalone SSE stream", async () => {
@@ -421,10 +625,13 @@ describe("Streamable HTTP Transport", () => {
 
       // Read the POST SSE response for the tool return value
       const postFrame = await readSSEEvent(postRes);
-      const postJson = parseSSEData(postFrame) as JSONRPCResponse;
+      const postJson = parseSSEData(postFrame) as JSONRPCResultResponse;
       expect(postJson.id).toBe("emit-log-1");
       const result = postJson.result as CallToolResult;
-      expect(result.content?.[0]?.text).toBe("logged:info");
+      expect(
+        result.content?.[0]?.type === "text" &&
+          result.content?.[0]?.text === "logged:info"
+      ).toBe(true);
 
       // Read the standalone SSE for the logging notification
       const pushFrame = await readOneFrame(standaloneReader);
@@ -442,6 +649,8 @@ describe("Streamable HTTP Transport", () => {
       // Standalone stream remains open
       const silent = await readSSEEventWithTimeout(standaloneReader, 50);
       expect(silent).toBeNull();
+
+      await standaloneReader.cancel();
     });
 
     it("should emit tools list_changed on install/uninstall and reflect in tools/list", async () => {
@@ -466,10 +675,13 @@ describe("Streamable HTTP Transport", () => {
       );
       expect(installRes.status).toBe(200);
       const installFrame = await readSSEEvent(installRes);
-      const installJson = parseSSEData(installFrame) as JSONRPCResponse;
+      const installJson = parseSSEData(installFrame) as JSONRPCResultResponse;
       expect(installJson.id).toBe("install-1");
       let result = installJson.result as CallToolResult;
-      expect(result?.content?.[0]?.text).toBe("temp tool installed");
+      expect(
+        result?.content?.[0]?.type === "text" &&
+          result?.content?.[0]?.text === "temp tool installed"
+      ).toBe(true);
 
       // Expect a tools/list_changed notification on the standalone stream
       let listChanged = await readOneFrame(standaloneReader);
@@ -486,7 +698,7 @@ describe("Streamable HTTP Transport", () => {
       let listRes = await sendPostRequest(ctx, baseUrl, listReq, sessionId);
       expect(listRes.status).toBe(200);
       let listFrame = await readSSEEvent(listRes);
-      let listJson = parseSSEData(listFrame) as JSONRPCResponse;
+      let listJson = parseSSEData(listFrame) as JSONRPCResultResponse;
       let tools = (listJson.result?.tools ?? []) as ListToolsResult["tools"];
       expect(tools.some((t) => t.name === "temp-echo")).toBe(true);
 
@@ -505,10 +717,13 @@ describe("Streamable HTTP Transport", () => {
       );
       expect(installRes.status).toBe(200);
       const runTempFrame = await readSSEEvent(runTempRes);
-      const runTempJson = parseSSEData(runTempFrame) as JSONRPCResponse;
+      const runTempJson = parseSSEData(runTempFrame) as JSONRPCResultResponse;
       expect(runTempJson.id).toBe("run-temp-1");
       result = runTempJson.result as CallToolResult;
-      expect(result?.content?.[0]?.text).toBe("echo:test");
+      expect(
+        result?.content?.[0]?.type === "text" &&
+          result?.content?.[0]?.text === "echo:test"
+      ).toBe(true);
 
       // Uninstall temp tool so we get another list_changed on standalone stream
       const uninstallMsg = {
@@ -525,7 +740,9 @@ describe("Streamable HTTP Transport", () => {
       );
       expect(uninstallRes.status).toBe(200);
       const uninstallFrame = await readSSEEvent(uninstallRes);
-      const uninstallJson = parseSSEData(uninstallFrame) as JSONRPCResponse;
+      const uninstallJson = parseSSEData(
+        uninstallFrame
+      ) as JSONRPCResultResponse;
       expect(uninstallJson.id).toBe("uninstall-1");
 
       listChanged = await readOneFrame(standaloneReader);
@@ -542,9 +759,283 @@ describe("Streamable HTTP Transport", () => {
       listRes = await sendPostRequest(ctx, baseUrl, listReq, sessionId);
       expect(listRes.status).toBe(200);
       listFrame = await readSSEEvent(listRes);
-      listJson = parseSSEData(listFrame) as JSONRPCResponse;
+      listJson = parseSSEData(listFrame) as JSONRPCResultResponse;
       tools = (listJson.result?.tools ?? []) as ListToolsResult["tools"];
       expect(tools.some((t) => t.name === "temp-echo")).toBe(false);
+
+      await standaloneReader.cancel();
+    });
+  });
+
+  describe("Header and Auth Handling", () => {
+    it("should pass custom headers to transport via requestInfo", async () => {
+      const ctx = createExecutionContext();
+      const sessionId = await initializeStreamableHTTPServer(ctx);
+
+      // Send request with custom headers using the echoRequestInfo tool
+      const echoMessage: JSONRPCMessage = {
+        id: "echo-headers-1",
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: {
+          name: "echoRequestInfo",
+          arguments: {}
+        }
+      };
+
+      const request = new Request(baseUrl, {
+        body: JSON.stringify(echoMessage),
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+          "mcp-session-id": sessionId,
+          "x-user-id": "test-user-123",
+          "x-request-id": "req-456",
+          "x-custom-header": "custom-value"
+        },
+        method: "POST"
+      });
+
+      const response = await worker.fetch(request, env, ctx);
+      expect(response.status).toBe(200);
+
+      // Parse the SSE response
+      const sseText = await readSSEEvent(response);
+      const parsed = parseSSEData(sseText) as JSONRPCResultResponse;
+      expect(parsed.id).toBe("echo-headers-1");
+
+      // Extract the echoed request info
+      const result = parsed.result as CallToolResult;
+      const firstContent = result.content?.[0];
+      const contentText =
+        firstContent?.type === "text" ? firstContent.text : undefined;
+      const echoedData = JSON.parse(
+        typeof contentText === "string" ? contentText : "{}"
+      );
+
+      // Verify custom headers were passed through
+      expect(echoedData.hasRequestInfo).toBe(true);
+      expect(echoedData.headers["x-user-id"]).toBe("test-user-123");
+      expect(echoedData.headers["x-request-id"]).toBe("req-456");
+      expect(echoedData.headers["x-custom-header"]).toBe("custom-value");
+
+      // Verify that certain internal headers that the transport adds are NOT exposed
+      // The transport adds cf-mcp-method and cf-mcp-message internally but should filter them
+      expect(echoedData.headers["cf-mcp-method"]).toBeUndefined();
+      expect(echoedData.headers["cf-mcp-message"]).toBeUndefined();
+      expect(echoedData.headers.upgrade).toBeUndefined();
+
+      // Verify standard headers are also present
+      expect(echoedData.headers.accept).toContain("text/event-stream");
+      expect(echoedData.headers["content-type"]).toBe("application/json");
+
+      // Verify sessionId is passed through extra data
+      expect(echoedData.sessionId).toBeDefined();
+      expect(echoedData.sessionId).toBe(sessionId);
+    });
+  });
+
+  describe("Standalone fan-out and resume supersession", () => {
+    const makeConnection = (
+      id: string,
+      state: {
+        streamId?: string;
+        _standaloneSse?: boolean;
+        requestIds?: string[];
+      }
+    ) => ({
+      id,
+      state,
+      send: vi.fn(),
+      close: vi.fn(),
+      setState: vi.fn()
+    });
+
+    const makeTransport = (
+      connections: ReturnType<typeof makeConnection>[],
+      agentOverrides: Record<string, unknown> = {}
+    ) => {
+      const agent = {
+        deleteStreamRequestIds: vi.fn(async () => undefined),
+        getStreamRequestIds: vi.fn(async () => undefined),
+        getConnections: () => connections,
+        getSessionId: () => "session-id",
+        ...agentOverrides
+      };
+      const transport = agentContext.run(
+        {
+          agent,
+          connection: undefined,
+          email: undefined,
+          request: undefined
+        },
+        () => new StreamableHTTPServerTransport({})
+      );
+      return { agent, transport };
+    };
+
+    it("sends a server notification on exactly one standalone stream", async () => {
+      // MCP: the server MUST send each message on only one stream and
+      // MUST NOT broadcast across multiple. `handleGetRequest`
+      // supersedes prior standalone connections so only one is ever
+      // live; this asserts the send path honours that and never
+      // touches a POST bridge.
+      const standalone = makeConnection("sse-1", { _standaloneSse: true });
+      const postBridge = makeConnection("post", {
+        streamId: "post",
+        requestIds: ["r1"]
+      });
+      const { agent, transport } = makeTransport([standalone, postBridge]);
+
+      const notification: JSONRPCNotification = {
+        jsonrpc: "2.0",
+        method: "notifications/message",
+        params: { level: "info", data: "hello" }
+      };
+
+      await agentContext.run(
+        {
+          agent,
+          connection: undefined,
+          email: undefined,
+          request: undefined
+        },
+        () => transport.send(notification)
+      );
+
+      expect(standalone.send).toHaveBeenCalledOnce();
+      // The POST bridge is not a standalone stream — it must not receive it.
+      expect(postBridge.send).not.toHaveBeenCalled();
+    });
+
+    it("stores but does not write when no standalone stream is live", async () => {
+      // No `_standaloneSse` connection attached: the event is stored
+      // for replay (verified elsewhere) and no live write happens.
+      const postBridge = makeConnection("post", {
+        streamId: "post",
+        requestIds: ["r1"]
+      });
+      let stored = 0;
+      const { agent, transport } = makeTransport([postBridge]);
+      (transport as unknown as { _eventStore: unknown })._eventStore = {
+        storeEvent: async () => {
+          stored++;
+          return "_GET_stream:0";
+        }
+      };
+
+      const notification: JSONRPCNotification = {
+        jsonrpc: "2.0",
+        method: "notifications/message",
+        params: { level: "info", data: "hello" }
+      };
+
+      await agentContext.run(
+        {
+          agent,
+          connection: undefined,
+          email: undefined,
+          request: undefined
+        },
+        () => transport.send(notification)
+      );
+
+      expect(stored).toBe(1);
+      expect(postBridge.send).not.toHaveBeenCalled();
+    });
+
+    it("closes a stale POST connection when a GET resumes its stream", async () => {
+      // Behavioural change: resuming an active POST stream supersedes
+      // any prior connection bound to the same streamId by closing it,
+      // so `send()` can't route tool progress to the dead bridge.
+      const stalePost = makeConnection("stream-A", {
+        streamId: "stream-A",
+        requestIds: ["r1"]
+      });
+      const resuming = makeConnection("resume-conn", {});
+      const { agent, transport } = makeTransport([stalePost, resuming], {
+        getStreamRequestIds: vi.fn(async () => ["r1"])
+      });
+      // Resolve the resumed event id back to stream-A.
+      (transport as unknown as { _eventStore: unknown })._eventStore = {
+        getStreamIdForEventId: async () => "stream-A",
+        storeEvent: async () => "stream-A:0",
+        replayEventsAfter: async () => "stream-A"
+      };
+
+      const req = new Request("http://example.com/mcp", {
+        method: "GET",
+        headers: {
+          Accept: "text/event-stream",
+          "mcp-session-id": "session-id",
+          "last-event-id": "stream-A:0000000000000001"
+        }
+      });
+
+      await agentContext.run(
+        {
+          agent,
+          connection: resuming as unknown as Connection,
+          email: undefined,
+          request: req
+        },
+        () => transport.handleGetRequest(req)
+      );
+
+      // The stale POST bridge is superseded.
+      expect(stalePost.close).toHaveBeenCalledOnce();
+      expect(stalePost.close).toHaveBeenCalledWith(
+        1000,
+        "Superseded by resumed stream"
+      );
+      // The resuming connection is not closed.
+      expect(resuming.close).not.toHaveBeenCalled();
+      // And it claims the persisted requestIds.
+      expect(resuming.setState).toHaveBeenCalledWith(
+        expect.objectContaining({ streamId: "stream-A", requestIds: ["r1"] })
+      );
+    });
+
+    it("supersedes a prior standalone GET when a fresh GET opens", async () => {
+      // MCP allows only one standalone GET per session. A fresh GET
+      // (no Last-Event-ID) closes the prior standalone connection
+      // rather than running two in parallel.
+      const priorStandalone = makeConnection("old-get", {
+        streamId: "_GET_stream",
+        _standaloneSse: true
+      });
+      const freshGet = makeConnection("new-get", {});
+      const { agent, transport } = makeTransport([priorStandalone, freshGet]);
+
+      const req = new Request("http://example.com/mcp", {
+        method: "GET",
+        headers: {
+          Accept: "text/event-stream",
+          "mcp-session-id": "session-id"
+        }
+      });
+
+      await agentContext.run(
+        {
+          agent,
+          connection: freshGet as unknown as Connection,
+          email: undefined,
+          request: req
+        },
+        () => transport.handleGetRequest(req)
+      );
+
+      expect(priorStandalone.close).toHaveBeenCalledWith(
+        1000,
+        "Superseded by resumed stream"
+      );
+      expect(freshGet.close).not.toHaveBeenCalled();
+      expect(freshGet.setState).toHaveBeenCalledWith(
+        expect.objectContaining({
+          streamId: "_GET_stream",
+          _standaloneSse: true
+        })
+      );
     });
   });
 });

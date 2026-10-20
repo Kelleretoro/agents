@@ -1,4 +1,3 @@
-/** biome-ignore-all lint/a11y/noStaticElementInteractions: it's fine */
 import "./app.css";
 
 import { useAgent } from "agents/react";
@@ -84,9 +83,9 @@ function Toast({ toast, onClose }: { toast: Toast; onClose: () => void }) {
     <div className={`toast ${toast.type}`}>
       <span className="toast-icon">{getIcon(toast.type)}</span>
       <span className="toast-message">{toast.message}</span>
-      <span className="toast-close" onClick={onClose}>
+      <button type="button" className="toast-close" onClick={onClose}>
         ✕
-      </span>
+      </button>
     </div>
   );
 }
@@ -200,6 +199,7 @@ function PatternSection({
         <div className="form-group">
           <label htmlFor="sequential-input">Marketing Copy Input</label>
           <input
+            aria-label="Marketing Copy Input"
             id="sequential-input"
             type="text"
             name="input"
@@ -221,6 +221,7 @@ function PatternSection({
         <div className="form-group">
           <label htmlFor="routing-query">Customer Query</label>
           <input
+            aria-label="Customer Query"
             id="routing-query"
             type="text"
             name="query"
@@ -242,6 +243,7 @@ function PatternSection({
         <div className="form-group">
           <label htmlFor="parallel-code">Code for Review</label>
           <textarea
+            aria-label="Code for Review"
             id="parallel-code"
             name="code"
             value={state.code}
@@ -266,6 +268,7 @@ function PatternSection({
         <div className="form-group">
           <label htmlFor="orchestrator-request">Feature Request</label>
           <textarea
+            aria-label="Feature Request"
             id="orchestrator-request"
             name="featureRequest"
             value={state.featureRequest}
@@ -288,6 +291,7 @@ function PatternSection({
           <div className="form-group">
             <label htmlFor="evaluator-text">Text to Translate</label>
             <textarea
+              aria-label="Text to Translate"
               id="evaluator-text"
               name="text"
               value={state.text}
@@ -550,6 +554,7 @@ export default function App() {
     <div className="container">
       <ToastContainer toasts={toasts} onClose={removeToast} />
       <header>
+        {/* oxlint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions -- theme toggle */}
         <div className="theme-toggle" onClick={toggleTheme}>
           <span className="theme-toggle-icon">
             {theme === "light" ? "🌞" : "🌙"}

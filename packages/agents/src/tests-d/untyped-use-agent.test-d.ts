@@ -1,4 +1,3 @@
-/** biome-ignore-all lint/correctness/useHookAtTopLevel: testing types */
 import type { env } from "cloudflare:workers";
 import { Agent } from "..";
 import { useAgent } from "../react";
@@ -13,6 +12,9 @@ declare class A extends Agent<typeof env, {}> {
 const a1 = useAgent<{}>({
   agent: "test"
 });
+
+// state should be typed as State | undefined
+a1.state satisfies {} | undefined;
 
 // ensure retro-compatibility with useAgent<State> API
 a1.call("fn");

@@ -4,12 +4,14 @@ import type { Context, Env } from "hono";
 import { env } from "hono/adapter";
 import { createMiddleware } from "hono/factory";
 
+type AgentEnv<E extends Env> = NonNullable<E["Bindings"]>;
+
 /**
  * Configuration options for the Cloudflare Agents middleware
  */
 type AgentMiddlewareContext<E extends Env> = {
   /** Cloudflare Agents-specific configuration options */
-  options?: AgentOptions<E>;
+  options?: AgentOptions<AgentEnv<E>>;
   /** Optional error handler for caught errors */
   onError?: (error: Error) => void;
 };
@@ -21,7 +23,7 @@ type AgentMiddlewareContext<E extends Env> = {
 export function agentsMiddleware<E extends Env = Env>(
   ctx?: AgentMiddlewareContext<E>
 ) {
-  return createMiddleware<Env>(async (c, next) => {
+  return createMiddleware<E>(async (c, next) => {
     try {
       const handler = isWebSocketUpgrade(c)
         ? handleWebSocketUpgrade
@@ -50,20 +52,24 @@ function isWebSocketUpgrade(c: Context): boolean {
 
 /**
  * Handles WebSocket upgrade requests
- * Returns a WebSocket upgrade response if successful, null otherwise
+ * Returns matched HTTP responses unchanged and null only when no Agent route matches
  */
 async function handleWebSocketUpgrade<E extends Env>(
   c: Context<E>,
-  options?: AgentOptions<E>
+  options?: AgentOptions<AgentEnv<E>>
 ) {
   const response = await routeAgentRequest(
     c.req.raw,
-    env(c) satisfies Env,
+    env(c) as AgentEnv<E>,
     options
   );
 
-  if (!response?.webSocket) {
+  if (response === null) {
     return null;
+  }
+
+  if (!response.webSocket) {
+    return response;
   }
 
   return new Response(null, {
@@ -78,7 +84,7 @@ async function handleWebSocketUpgrade<E extends Env>(
  */
 async function handleHttpRequest<E extends Env>(
   c: Context<E>,
-  options?: AgentOptions<E>
+  options?: AgentOptions<AgentEnv<E>>
 ) {
-  return routeAgentRequest(c.req.raw, env(c) satisfies Env, options);
+  return routeAgentRequest(c.req.raw, env(c) as AgentEnv<E>, options);
 }
