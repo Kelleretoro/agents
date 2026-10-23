@@ -13,7 +13,7 @@ import { WebSockets } from "agents/websockets";
 import { PiSessionSockets } from "./sockets";
 import { createWorkspaceTools, JAVASCRIPT_BACKEND } from "./workspace";
 
-const MODEL_ID = "@cf/moonshotai/kimi-k2.7-code";
+const MODEL_ID = "@cf/zai-org/glm-5.3-flash";
 
 const PREAMBLE =
   "You are a concise playground assistant. You have a durable workspace at /workspace: read, write, edit, delete, list (ls), find and grep files there, and run JavaScript modules in it with exec, which can also use git. Paths are absolute. Use tools whenever they can answer the request, and explain their results plainly.";
@@ -41,7 +41,7 @@ export class PiAgent extends DurableObject<Env> {
   });
   readonly registry = createRegistry();
   readonly harness = new PiHarness({
-    harness: async ({ storage, context }) => {
+    harness: async ({ storage, context, onWake }) => {
       // pi's own extension: the system prompt and the workspace tools.
       this.registry.install({
         name: "playground",
@@ -55,15 +55,11 @@ export class PiAgent extends DurableObject<Env> {
         {
           models,
           registry: this.registry,
+          onWake,
           settings: {
             // pi doubles the delay before each retry: 1, 2, 4, 8 and 16 seconds,
             // so a rate-limited model gets about 30 seconds to recover.
-            retry: { enabled: true, maxRetries: 5, baseDelayMs: 1000 },
-            // Pi keeps idle caches behind ten-minute timers by default. A
-            // pending timer keeps the object in memory and stops it from
-            // hibernating, and its SQLite is local, so skip the caches.
-            contextRetentionMs: 0,
-            documentRetentionMs: 0
+            retry: { enabled: true, maxRetries: 5, baseDelayMs: 1000 }
           },
           onReport: (error) => console.warn("pi report", error)
         },

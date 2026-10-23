@@ -6,13 +6,19 @@ import {
 import { isCatalogModelId, isWorkersAIId } from "./catalog";
 import { type ResumeFetch, resumableBody } from "./resume";
 import type { GatewayProviderName } from "./gateway-providers";
-import type { AISettings, ResolvedGateway } from "./settings";
+import type { AccountAccess, AISettings, ResolvedGateway } from "./settings";
 
 /** The reported `url` for a provider-native call made through the binding. */
 const NATIVE_BINDING_URL = "ai-gateway-binding-native";
 
 /** The origin the binding's own `fetch` answers on. */
 const BINDING_ORIGIN = "https://workers-binding.ai";
+
+/** The REST API's run path, for a model id reached with an account and token. */
+const REST_API_ORIGIN = "https://api.cloudflare.com/client/v4/accounts";
+
+/** The provider-native path, for a model object reached with a token. */
+const GATEWAY_ORIGIN = "https://gateway.ai.cloudflare.com/v1";
 
 /**
  * The `Ai` binding's `fetch`. The binding has one at runtime (workerd's
@@ -53,6 +59,19 @@ export interface TransportRequest {
   headers: Record<string, string>;
   /** Abort signal, forwarded to the binding or to `fetch`. */
   signal?: AbortSignal;
+  /**
+   * Audio for a Workers AI model that takes it as a raw body
+   * (`audio: { body, contentType }`, as Deepgram's Nova-3 does). `input`
+   * carries the model's other fields. The request goes to Workers AI
+   * directly: AI Gateway does not accept the body.
+   */
+  audio?: RawAudio;
+}
+
+/** Audio bytes and their media type, sent as a request body of their own. */
+export interface RawAudio {
+  bytes: Uint8Array;
+  contentType: string;
 }
 
 /**
@@ -81,9 +100,9 @@ export interface NativeRequest {
 }
 
 /**
- * The single code path both backends implement. Always resolves to a raw
- * `Response`, so streaming and non-streaming calls share one path and nothing
- * is buffered on the caller's behalf.
+ * The single code path both backends, the binding and HTTP, implement. Always
+ * resolves to a raw `Response`, so streaming and non-streaming calls share one
+ * path and nothing is buffered on the caller's behalf.
  *
  * @experimental This surface is experimental and may change.
  */
@@ -292,15 +311,16 @@ function gatewayHeaders(gateway: ResolvedGateway): Record<string, string> {
 }
 
 /**
- * The binding's options for the Workers AI run path: the gateway options its
- * `GatewayOptions` type defines, and the headers for the ones it does not.
+ * The run path's gateway options, and the headers for the ones the binding's
+ * `GatewayOptions` type does not define. Both transports use it: the binding
+ * takes `gateway` as an options object, HTTP as `cf-aig-*` headers.
  *
- * `byokAlias` reaches `/run` as `cf-aig-byok-alias`, which aig-entry forwards
- * and `/run` reads for a catalog model's stored key. `zdr` is left off: `/run`
- * does not read it, so it applies to provider-native requests only.
+ * `byokAlias` reaches `/run` as `cf-aig-byok-alias`, which `/run` reads for a
+ * catalog model's stored key. `zdr` is left off: `/run` does not read it, so it
+ * applies to provider-native requests only.
  */
 function runOptions(request: TransportRequest): {
-  gateway: GatewayOptions;
+  gateway: Omit<ResolvedGateway, "byokAlias" | "zdr">;
   headers: Record<string, string>;
 } {
   const { byokAlias, zdr: _zdr, ...gateway } = request.gateway;
@@ -479,6 +499,27 @@ function bindingTransport(binding: Ai): Transport {
     },
     async run(request) {
       try {
+        if (request.audio !== undefined) {
+          // TODO: send this through the gateway once AI Gateway takes a stream
+          // body; today the binding refuses one when `gateway` is set.
+          return await raw.run(
+            request.model,
+            {
+              ...request.input,
+              audio: {
+                body: new Response(new Uint8Array(request.audio.bytes)).body,
+                contentType: request.audio.contentType
+              }
+            },
+            {
+              ...(Object.keys(request.headers).length > 0
+                ? { extraHeaders: request.headers }
+                : {}),
+              returnRawResponse: true,
+              signal: request.signal
+            }
+          );
+        }
         // Called as a method, never detached: the binding reads private
         // fields and throws on a detached reference.
         const run = runOptions(request);
@@ -552,6 +593,183 @@ function bindingTransport(binding: Ai): Transport {
 }
 
 /**
+ * Request headers with the credential set last. `Headers` matches names
+ * case-insensitively, so a caller's `Authorization` is replaced rather than
+ * sent alongside the token.
+ */
+function withCredential(
+  headers: Record<string, string>,
+  name: "authorization" | "cf-aig-authorization",
+  token: string
+): Headers {
+  const result = new Headers(headers);
+  result.set(name, `Bearer ${token}`);
+  return result;
+}
+
+/**
+ * A Workers AI answer as the binding returns it. The REST API wraps a JSON
+ * answer in the `{ success, result }` envelope where the binding returns the
+ * bare result, so a successful envelope is unwrapped; anything else is left
+ * for the caller, as it is on the binding.
+ */
+async function bareWorkersAIAnswer(response: Response): Promise<Response> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!response.ok || !contentType.includes("application/json")) {
+    return response;
+  }
+  const text = await response.text();
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = undefined;
+  }
+  const record =
+    body !== null && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : undefined;
+  const unwrapped =
+    record?.success === true && "result" in record ? record.result : undefined;
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  return new Response(
+    unwrapped === undefined ? text : JSON.stringify(unwrapped),
+    { headers, status: response.status, statusText: response.statusText }
+  );
+}
+
+/**
+ * The HTTP backend, for an account id and API token. A model id goes to the
+ * REST API, which serves it with the same `/run` call the binding makes: a
+ * Workers AI id on `/ai/run/{model}` with its own input, any other id on the
+ * endpoint for its request format with the model in the body. A model object
+ * goes to the provider-native path on `gateway.ai.cloudflare.com`, exactly as
+ * the binding's `fetch` forwards it.
+ *
+ * A dropped stream is not resumed: the binding has a resume route, but the
+ * public one is not open to every gateway yet.
+ */
+function httpTransport({ accountId, apiToken }: AccountAccess): Transport {
+  const account = encodeURIComponent(accountId);
+  const runBase = `${REST_API_ORIGIN}/${account}/ai`;
+  /**
+   * A raw audio body goes to Workers AI's own run route, with the model's
+   * other fields as query parameters. TODO: send it through the gateway once
+   * AI Gateway accepts the body; today the REST API answers `500` when
+   * `cf-aig-gateway-id` is set.
+   */
+  async function runRawAudio(
+    request: TransportRequest,
+    audio: RawAudio
+  ): Promise<Response> {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(request.input)) {
+      if (
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean"
+      ) {
+        query.set(key, String(value));
+      }
+    }
+    const search = query.size > 0 ? `?${query}` : "";
+    const url = `${runBase}/run/${request.model}${search}`;
+    try {
+      const response = await fetch(url, {
+        body: new Uint8Array(audio.bytes),
+        headers: withCredential(
+          { ...request.headers, "content-type": audio.contentType },
+          "authorization",
+          apiToken
+        ),
+        method: "POST",
+        signal: request.signal
+      });
+      return await bareWorkersAIAnswer(response);
+    } catch (error) {
+      throw normalizeThrownError(error, {
+        model: request.model,
+        requestBodyValues: request.input,
+        url
+      });
+    }
+  }
+
+  return {
+    logIdFallback() {
+      return undefined;
+    },
+    async run(request) {
+      if (request.audio !== undefined)
+        return runRawAudio(request, request.audio);
+      const workersAI = isWorkersAIId(request.model);
+      const run = runOptions(request);
+      const url = workersAI
+        ? `${runBase}/run/${request.model}`
+        : `${runBase}${OPENAI_ENDPOINTS[request.format ?? "chat-completions"]}`;
+      try {
+        const response = await fetch(url, {
+          body: JSON.stringify(
+            workersAI
+              ? request.input
+              : { ...request.input, model: request.model }
+          ),
+          headers: withCredential(
+            {
+              "content-type": "application/json",
+              ...gatewayHeaders(run.gateway),
+              "cf-aig-gateway-id": run.gateway.id,
+              ...run.headers
+            },
+            "authorization",
+            apiToken
+          ),
+          method: "POST",
+          signal: request.signal
+        });
+        return workersAI ? await bareWorkersAIAnswer(response) : response;
+      } catch (error) {
+        throw normalizeThrownError(error, {
+          model: request.model,
+          requestBodyValues: request.input,
+          url
+        });
+      }
+    },
+    async native(request) {
+      const url = `${GATEWAY_ORIGIN}/${account}/${encodeURIComponent(
+        request.gateway.id
+      )}/${request.provider}/${request.endpoint}`;
+      try {
+        return await fetch(url, {
+          body: request.body ?? null,
+          // A stream body needs `duplex: "half"` in Node's fetch, which
+          // rejects the request without it. workerd accepts it too.
+          ...(request.body instanceof ReadableStream
+            ? ({ duplex: "half" } as RequestInit)
+            : {}),
+          headers: withCredential(
+            { ...request.headers, ...gatewayHeaders(request.gateway) },
+            "cf-aig-authorization",
+            apiToken
+          ),
+          method: request.method,
+          signal: request.signal
+        });
+      } catch (error) {
+        throw normalizeThrownError(error, {
+          model: `${request.provider}/${request.endpoint}`,
+          requestBodyValues: undefined,
+          url
+        });
+      }
+    },
+    url: runBase
+  };
+}
+
+/**
  * Builds the transport for a set of provider settings. The model id, not the
  * caller, decides the wire format; the transport only decides how the request
  * physically leaves the Worker.
@@ -559,8 +777,9 @@ function bindingTransport(binding: Ai): Transport {
  * @experimental This surface is experimental and may change.
  */
 export function createTransport(settings: AISettings): Transport {
-  if (settings.binding === undefined) {
-    throw new Error("createAI requires { binding }: the Workers AI binding.");
-  }
-  return bindingTransport(settings.binding);
+  if (settings.binding !== undefined) return bindingTransport(settings.binding);
+  if (settings.accountId && settings.apiToken) return httpTransport(settings);
+  throw new Error(
+    "createAI requires { binding } (the AI binding) or { accountId, apiToken }."
+  );
 }

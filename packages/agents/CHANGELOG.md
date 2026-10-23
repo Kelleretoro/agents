@@ -1,5 +1,100 @@
 # @cloudflare/agents
 
+## 0.30.1
+
+### Patch Changes
+
+- [#2684](https://github.com/cloudflare/agents/pull/2684) [`9c79ba1`](https://github.com/cloudflare/agents/commit/9c79ba12778cbb53b6c50db79282d780466c9897) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Fix `PiHarness` with `onWake` not resuming a sleeping Pi task, such as a compaction retry, while another task is running ([#2683](https://github.com/cloudflare/agents/issues/2683)). See [How recovery works](https://developers.cloudflare.com/agents/harnesses/pi/#how-recovery-works).
+
+## 0.30.0
+
+This release adds support for [Pi 1.4](https://github.com/earendil-works/pi/blob/v1.4.0/packages/durable/CHANGELOG.md#140---2026-10-21) and makes `PiHarness` recover more reliably from evictions, crashes and storage errors.
+
+### Highlights
+
+- **Pi 1.4 support:** `agents/harness/pi` now runs on Pi 1.4.
+- **Hibernation while Pi's tasks sleep:** `PiHarness` passes Pi's `onWake` through your harness factory, so a Durable Object sleeps until Pi's next task is due instead of staying in memory.
+- **One wake job per object:** `PiHarness` wakes from Pi's `wake()`, so a task stopped by Pi's restart limit no longer keeps the object awake.
+- **Parked tasks:** tasks stopped by Pi's restart limit show as `parked` in `pending()`, and `retry()` runs them again.
+- **Recovery:** Pi reopens after a storage error instead of failing every call until the object restarts, and the wake job survives failed steps with backoff.
+- **Fixes:** Lifecycle no longer keeps evicted Durable Objects in memory, and it arms a fallback alarm when startup fails. pi-ai now reports cut-off model streams with wording Pi treats as transient, so Pi retries them.
+
+### Upgrading
+
+1. **Update Pi to `~1.4.0`** (`@earendil-works/pi-durable`, `pi-ai`, `pi-agent-core`) and install `@earendil-works/chord` alongside them. Pi 1.4 migrates session storage to a schema Pi 1.3 cannot open, so a deployment cannot roll back past this release.
+2. **Check [pi-durable's 1.4.0 changelog](https://github.com/earendil-works/pi/blob/v1.4.0/packages/durable/CHANGELOG.md#140---2026-10-21)** for its breaking changes, such as the removal of `TaskRuntime.sleep()`, the new `sleeping` task status, and the restart limit that parks a crash-looping task after 5 restarts.
+3. **Pass `onWake` to `Harness.open`**, as in the diff below. Without it, the harness still works but logs a warning, and the object stays in memory while Pi's tasks sleep.
+4. **If you create Pi's registry at module scope, move it into your class**, as a field or in the factory. Our tool examples showed module scope before this release. Pi keeps every `Harness` subscribed to its registry until it closes, and an evicted object never closes it, so a module-level registry keeps every evicted object's harness in memory.
+
+   ```diff
+   - const registry = createRegistry();
+     export class Assistant extends Agent<Env> {
+   +   registry = createRegistry();
+       harness = new PiHarness({
+         harness: ({ storage, context, onWake }) =>
+   -       Harness.open(storage, { models, registry }, context)
+   +       Harness.open(storage, { models, registry: this.registry, onWake }, context)
+       });
+     }
+   ```
+
+5. **Keep the harness factory safe to run more than once.** It now runs again when Pi reopens after a storage error.
+6. **Handle the new `parked` status** if you switch on `PiPendingOperation.status`.
+
+Existing objects need no migration step. Wake jobs left by earlier releases are handed over to the new wake job on first start.
+
+### Minor Changes
+
+- [#2617](https://github.com/cloudflare/agents/pull/2617) [`cfe9d0f`](https://github.com/cloudflare/agents/commit/cfe9d0f3d5de5e07fc77e5edc320d423e6634295) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Support Pi 1.4: the Pi peer range is now `~1.4.0`. Pi 1.4 migrates SQLite session storage to a schema that Pi 1.3 cannot open, so a deployment cannot roll back past this release. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2619](https://github.com/cloudflare/agents/pull/2619) [`4b535dc`](https://github.com/cloudflare/agents/commit/4b535dc9f30f85a295261e545bc18cf58dfa012f) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` hands its factory an `onWake` to pass to `Harness.open`, so the Durable Object can hibernate while Pi's tasks sleep. Add it to your factory: `harness: ({ storage, context, onWake }) => Harness.open(storage, { ...options, onWake }, context)`. Without it the harness still works and logs a warning. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2624](https://github.com/cloudflare/agents/pull/2624) [`3954859`](https://github.com/cloudflare/agents/commit/3954859b3d2b56bcf8e0425bda39608de7744dfe) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` shows operations stopped by Pi's restart limit as `parked` in `pending()`, and `retry()` runs them again. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/#how-recovery-works).
+
+### Patch Changes
+
+- [#2644](https://github.com/cloudflare/agents/pull/2644) [`f404547`](https://github.com/cloudflare/agents/commit/f404547453d412d04aafedff7d624d384c6e70d8) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Lifecycle arms a fallback alarm while its job queue holds jobs, before startup runs in an alarm and after a startup that queued jobs throws, so a failed startup cannot leave queued jobs without a wake. See [Lifecycle](https://github.com/cloudflare/agents/blob/main/docs/agents/lifecycle.md).
+
+- [#2653](https://github.com/cloudflare/agents/pull/2653) [`fc4cd24`](https://github.com/cloudflare/agents/commit/fc4cd249b962f481fa8d6c1692e9bf10db2878cf) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Stop Lifecycle startup keeping an evicted Durable Object in memory when a capability's startup leaves a promise pending, as `PiHarness` does when it opens Pi. See [Pi harness](https://github.com/cloudflare/agents/blob/main/docs/agents/harnesses/pi.md#create-the-harness).
+
+- [#2643](https://github.com/cloudflare/agents/pull/2643) [`e117121`](https://github.com/cloudflare/agents/commit/e117121fff687a0320b96cb22da63cb089855a04) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `agents/models/pi-ai` reports a cut-off or idle model stream with wording pi's retry policy treats as transient, so pi retries the turn instead of failing it. See [Models with pi-ai](https://github.com/cloudflare/agents/blob/main/docs/agents/models-pi-ai.md).
+
+- [#2617](https://github.com/cloudflare/agents/pull/2617) [`cfe9d0f`](https://github.com/cloudflare/agents/commit/cfe9d0f3d5de5e07fc77e5edc320d423e6634295) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `agents/harness/pi` now uses chord's own context helpers, so install `@earendil-works/chord` alongside pi-durable and pi-ai. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2648](https://github.com/cloudflare/agents/pull/2648) [`000fcaf`](https://github.com/cloudflare/agents/commit/000fcaf67670cfedfc0923726f7400cf2524ca76) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` opens pi again after a storage error closes it, instead of failing every call until the object restarts. See [How recovery works](https://developers.cloudflare.com/agents/harnesses/pi/#how-recovery-works).
+
+- [#2618](https://github.com/cloudflare/agents/pull/2618) [`3e91ded`](https://github.com/cloudflare/agents/commit/3e91ded5295aef63bd40e34cb5f3396d0be11992) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` wakes from Pi's `wake()` with one job per object, so a task parked by Pi's restart limit no longer keeps the Durable Object awake. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2649](https://github.com/cloudflare/agents/pull/2649) [`91a8f61`](https://github.com/cloudflare/agents/commit/91a8f611ac4cb205e6a8efd3481af851022a8958) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` keeps its wake job when a step fails, retrying with a backoff up to 10 minutes, and counts a memory-limit reset during the job's wait against the alarm memory-limit breaker. See [How recovery works](https://developers.cloudflare.com/agents/harnesses/pi/#how-recovery-works).
+
+## 0.29.0
+
+### Minor Changes
+
+- [#2560](https://github.com/cloudflare/agents/pull/2560) [`8c720d3`](https://github.com/cloudflare/agents/commit/8c720d3b0d7703741bf0f6e47b571d3e21c50742) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Agent Skills read and write a `@cloudflare/computer` Workspace, for both projection and `skills.runner()`. See [Upgrading to a Computer workspace](https://github.com/cloudflare/agents/blob/main/docs/think/index.md#upgrading-to-a-computer-workspace).
+
+### Patch Changes
+
+- [#2584](https://github.com/cloudflare/agents/pull/2584) [`3b3a88e`](https://github.com/cloudflare/agents/commit/3b3a88e487398f4120023f1c75830bc703b14216) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `Browser` creates and closes its Browser Run sessions with the binding's typed `acquire()` and `closeSession()`, falling back to the HTTP API in fully local dev. See [Browser](https://developers.cloudflare.com/agents/tools/browser/).
+
+- [#2615](https://github.com/cloudflare/agents/pull/2615) [`05843e4`](https://github.com/cloudflare/agents/commit/05843e428be0d8b43a5bf1923d8e40adce6f213d) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Chat recovery now seals a turn after `chatRecovery.maxInterruptedAttempts` interrupted attempts (default 5), so a turn that exceeds the Durable Object memory limit on every run no longer retries forever; `maxOomRetries` is deprecated. See [Stream Recovery](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md#stream-recovery).
+
+- [#2604](https://github.com/cloudflare/agents/pull/2604) [`5d6f5d6`](https://github.com/cloudflare/agents/commit/5d6f5d66c9095b4871e810b6f72dd0c3206c7087) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createAI` takes `{ accountId, apiToken }` in place of `binding`, to use a gateway in another account or to run outside a Worker. See [the models docs](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md#account-id-and-api-token).
+
+- [#2622](https://github.com/cloudflare/agents/pull/2622) [`2c68a71`](https://github.com/cloudflare/agents/commit/2c68a718334cb7bac102afc16a067f8ff19973ee) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createAI` transcribes with `@cf/deepgram/nova-3`. See [the models docs](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md#other-modalities).
+
+- [#2576](https://github.com/cloudflare/agents/pull/2576) [`b048873`](https://github.com/cloudflare/agents/commit/b04887397fa99fd785f8323076e61a2b76e6ca5f) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createAI` no longer uses AI Gateway's deprecated Universal Endpoint. Model ids, now including catalog ids like `anthropic/claude-opus-4.8`, run on `env.AI.run`; model objects go to the provider-native path. Adds `byokAlias`, fixes pi-ai catalog models and dynamic routes, and lets `agents/models/opencode` take catalog ids. See [the models docs](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md).
+
+- [#2589](https://github.com/cloudflare/agents/pull/2589) [`841cc18`](https://github.com/cloudflare/agents/commit/841cc1813b21de3ca3228a08185e4ce1568eb972) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createAI` resumes a catalog or dynamic route stream that drops mid-answer, with nothing lost or repeated. See [the models docs](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md#stream-resume).
+
+- [#2594](https://github.com/cloudflare/agents/pull/2594) [`cc34652`](https://github.com/cloudflare/agents/commit/cc34652df94ed583120cddc0412660dda3515e42) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `agents/models/pi-ai` resolves Claude ids from pi-ai 1.2's gateway catalog under AI Gateway's spelling, `anthropic/claude-opus-4.8`. See [Models for pi-ai](https://developers.cloudflare.com/agents/models/pi-ai/).
+
+- [#2594](https://github.com/cloudflare/agents/pull/2594) [`cc34652`](https://github.com/cloudflare/agents/commit/cc34652df94ed583120cddc0412660dda3515e42) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Support Pi 1.3: the Pi web search, web fetch, browser, and skills tools return `output`, and the Pi peer range is now `~1.3.0`. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2621](https://github.com/cloudflare/agents/pull/2621) [`e80a201`](https://github.com/cloudflare/agents/commit/e80a2013af633d76439d7fd67b909dee5e80b62d) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` `submit()` and `steer()` now accept pi-durable's `entry` option, which labels an input with a transcript kind of your own (for example `app.approval`) instead of `pi.user`. Before, the harness had no way to pass it. See [Label input the user did not type](https://developers.cloudflare.com/agents/harnesses/pi/#label-input-the-user-did-not-type).
+
+- [#2616](https://github.com/cloudflare/agents/pull/2616) [`65ddec8`](https://github.com/cloudflare/agents/commit/65ddec801904f0150acbecbac81f910f06f79a97) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `openPiSessionStore` now uses pi-durable's own Durable Object SQLite adapter, so several Pi storages in one object share its operation queue. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
 ## 0.28.1
 
 ### Patch Changes

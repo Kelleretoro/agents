@@ -1,18 +1,21 @@
 # Pi harness
 
-An experimental example that runs [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable),
+An example that runs [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable),
 pi's durable agent harness, inside a Durable Object. `PiHarness` and the
 session store come from `agents/harness/pi`, and the model provider from
-`agents/models/pi-ai`. Both entry points are experimental. This example adds
-the app around them.
+`agents/models/pi-ai`. This example adds the app around them.
+
+New to `PiHarness`? Start with the
+[Pi harness docs](https://developers.cloudflare.com/agents/harnesses/pi/).
 
 The example composes:
 
 - `PiHarness extends LifecycleCapability`, the harness interface:
   `harness.prompt()`, `harness.submit()`, `harness.sessions`,
   `harness.session(id)`, and `session.events()` for pi's live events;
-- one Lifecycle job per session as the wake: it keeps the object alive while
-  pi has live tasks in the session, and completes when there are none;
+- one Lifecycle job as the wake, driven by pi's `onWake`: it keeps the
+  object alive while pi has work running, is due when pi's next sleep ends,
+  and completes when pi has nothing to do;
 - a pi session store on the object's SQLite database;
 - app glue that is not part of the harness: `sockets.ts` puts one session
   per socket on `WebSockets`, and `view.ts` and `transcript.ts` fold pi's
@@ -55,6 +58,12 @@ before a tool was added never sees it; start a new session instead.
 Reload the page mid-turn: the client gets a snapshot of the current state,
 including the partial answer, and continues from there.
 
+A submit whose answer the socket never delivered is sent again on
+reconnect. The client (`src/outbox.ts`) names every submit with an
+`operationId` and keeps it in memory until its `result` or `error` arrives.
+The harness deduplicates by operation id, so the submit runs once: one it
+already admitted answers `accepted: false`.
+
 ## Test
 
 ```sh
@@ -65,6 +74,8 @@ pnpm test
   socket, a client joining mid-run, and a socket that outlives an eviction.
 - `view.test.ts` checks that a client following a run and one joining after
   it fold pi's events into the same view.
+- `outbox.test.ts` checks the client's command outbox, and that a submit
+  sent again on reconnect runs once.
 
 The harness's own tests live with it in `packages/agents`
 (`pnpm run test:harness:pi` there): pi's storage conformance suite on a
@@ -93,7 +104,7 @@ export class PiAgent extends DurableObject<Env> {
   // pi's own registry: the system prompt and the workspace tools.
   readonly registry = createRegistry();
   readonly harness = new PiHarness({
-    harness: ({ storage, context }) => {
+    harness: ({ storage, context, onWake }) => {
       this.registry.install({
         name: "playground",
         sections: [{ key: "preamble", render: () => PREAMBLE, tag: false }],
@@ -101,7 +112,7 @@ export class PiAgent extends DurableObject<Env> {
       });
       return Harness.open(
         storage,
-        { models: this.#models(), registry: this.registry },
+        { models: this.#models(), registry: this.registry, onWake },
         context
       );
     },
@@ -129,8 +140,9 @@ await side.submit("Summarise the repo", { whenBusy: "steer" });
 
 The factory builds everything pi's `Harness.open` takes: models, the
 registry, and `settings` (this app retries model requests there). The
-harness hands it pi's storage over the object's SQLite database and a
-background context. The system prompt and tools are a pi extension on the
+harness hands it pi's storage over the object's SQLite database, a
+background context, and `onWake`, which the factory passes on so pi's
+sleeping tasks wake from the object's alarm. The system prompt and tools are a pi extension on the
 app's registry; tools are pi-durable `ToolRegistration`s. `replay: "safe"`
 lets pi run a call again after an eviction interrupted it; otherwise the
 model gets an interrupted result. For `agents/skills` sources,
@@ -184,7 +196,7 @@ files, so cloning works while the module itself has no network.
 ## Package sources
 
 Pi comes from npm: `@earendil-works/pi-durable`, `pi-ai`, `chord` and
-`pi-telemetry` at `~1.3.0`. Pi is MIT licensed; see
+`pi-telemetry` at `~1.4.0`. Pi is MIT licensed; see
 [`licenses/mit-earendil-pi.txt`](./licenses/mit-earendil-pi.txt).
 
 `@cloudflare/computer` comes from npm at `^0.5.1`. 0.5 is the first release with

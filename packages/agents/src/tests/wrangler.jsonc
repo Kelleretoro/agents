@@ -29,8 +29,16 @@
         "name": "RetryableStartObject"
       },
       {
+        "class_name": "AlarmStartFailureObject",
+        "name": "AlarmStartFailureObject"
+      },
+      {
         "class_name": "ConcurrentStartObject",
         "name": "ConcurrentStartObject"
+      },
+      {
+        "class_name": "EvictableStartObject",
+        "name": "EvictableStartObject"
       },
       {
         "class_name": "ScheduledLifecycleObject",
@@ -449,7 +457,9 @@
         "PlainLifecycleObject",
         "StatefulPlainObject",
         "RetryableStartObject",
+        "AlarmStartFailureObject",
         "ConcurrentStartObject",
+        "EvictableStartObject",
         "ScheduledLifecycleObject",
         "SchedulerHarnessObject",
         "SchedulerStartupWarnObject",

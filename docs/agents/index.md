@@ -49,7 +49,7 @@ The Lifecycle runs startup, routes requests to capabilities, and owns the object
 
 ## Harnesses
 
-- [Pi harness (Beta)](./harnesses/pi.md) - Host pi-durable sessions in a Durable Object with durable storage and lifecycle wakeups
+- [Pi harness](./harnesses/pi.md) - Host pi-durable sessions in a Durable Object with durable storage and lifecycle wakeups
 - [Think harness (Experimental)](./harnesses/think.md) - Run Think's agent loop as a Lifecycle capability, with transcripts in Sessions, output in Streams, and turns that survive eviction
 - [Think (Experimental)](https://github.com/cloudflare/agents/blob/main/docs/think/index.md) - Opinionated chat agent with built-in memory, tools, and streaming. Extends `Think`, which builds on `Agent`.
 
@@ -137,7 +137,7 @@ Building your own harness? Sessions stores the conversation, Streams holds durab
 - TODO: [TanStack Integration](./tanstack.md) - Using TanStack AI with agents
 - TODO: [Using AI Models](./using-ai-models.md) - OpenAI, Anthropic, Workers AI, and other providers
 - [Models (Experimental)](./models.md) - `createAI` — one AI SDK provider for Workers AI and third-party catalog models, same string space
-- [Models for pi-ai (Beta)](./models-pi-ai.md) - `createAI` for pi-ai: Workers AI ids and third-party models through AI Gateway, as a pi-ai provider
+- [Models for pi-ai](./models-pi-ai.md) - `createAI` for pi-ai: Workers AI ids and third-party models through AI Gateway, as a pi-ai provider
 - [Context (Experimental)](./context.md) - System-prompt blocks, frozen prompts, writable/searchable/loadable providers, and their tools
 - [Workspace (Experimental)](https://github.com/cloudflare/agents/blob/main/docs/shell/index.md) - Durable virtual filesystem backed by SQLite + R2
 - [Codemode (Experimental)](./codemode.md) - LLM-generated executable code for tool orchestration
@@ -149,10 +149,10 @@ Building your own harness? Sessions stores the conversation, Streams holds durab
 
 ## MCP (Model Context Protocol)
 
-- [Creating MCP Servers](./mcp-servers.md) - Build MCP servers with `McpAgent`
+- [Creating MCP Servers](./mcp-servers.md) - Build stateless MCP servers with `createMcpHandler`
 - [Securing MCP Servers](./securing-mcp-servers.md) - OAuth and authentication for MCP
 - [Connecting to MCP Servers](./mcp-client.md) - `MCPClientManager` on a Durable Object, or `addMcpServer()` on an Agent
-- [MCP Transports](./mcp-transports.md) - Transport options: Streamable HTTP, SSE, and RPC
+- [MCP Transports](./mcp-transports.md) - Streamable HTTP on the server, and the transports an Agent can connect with
 
 ## Operations
 

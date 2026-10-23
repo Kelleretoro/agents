@@ -118,7 +118,13 @@ const lifecycleEventSinks = new WeakMap<object, LifecycleEventSink>();
 const lifecycleRouteTransports = new WeakMap<object, LifecycleRouteTransport>();
 const lifecycleHostInvokers = new WeakMap<object, LifecycleHostInvoker>();
 
-/** Lifecycles whose startup the current async context is running inside. */
+/**
+ * Startup tokens of the Lifecycles whose startup the current async context
+ * is running inside. The scope holds opaque tokens, never a Lifecycle: every
+ * promise reaction created during startup keeps this async context, and
+ * workerd does not trace async context values during GC. A pending promise
+ * stored on a capability would otherwise keep an evicted object alive.
+ */
 const lifecycleStartupScope = new AsyncLocalStorage<ReadonlySet<object>>();
 
 /** @internal Adapt the host invocation boundary at a composition root. */
@@ -673,6 +679,8 @@ export class Lifecycle<
   }
 
   #startup: Promise<void> | undefined;
+  /** Marks this Lifecycle in {@link lifecycleStartupScope}. */
+  readonly #startupToken = {};
 
   #ensureInitialized(): Promise<void> {
     if (this.#status === "started") return Promise.resolve();
@@ -687,7 +695,9 @@ export class Lifecycle<
       this.#startup = startup;
       return startup;
     }
-    if (lifecycleStartupScope.getStore()?.has(this)) return Promise.resolve();
+    if (lifecycleStartupScope.getStore()?.has(this.#startupToken)) {
+      return Promise.resolve();
+    }
     return this.#startup;
   }
 
@@ -702,7 +712,7 @@ export class Lifecycle<
 
     this.#capabilitiesLocked = true;
     const scope = new Set(lifecycleStartupScope.getStore());
-    scope.add(this);
+    scope.add(this.#startupToken);
     let error: unknown;
     await this.#ctx.blockConcurrencyWhile(() =>
       lifecycleStartupScope.run(scope, async () => {
@@ -724,8 +734,17 @@ export class Lifecycle<
     // Re-throw outside blockConcurrencyWhile so the input gate is not
     // permanently broken and a later invocation can retry startup.
     if (error) {
+      const rearmRequested = this.#rearmRequestedDuringStart;
       this.#rearmRequestedDuringStart = false;
       this.#pendingEvents.length = 0;
+      if (rearmRequested) {
+        // Jobs pushed or re-timed during the failed startup deferred their
+        // re-arm to here. Arm the startup fallback from the current queue so
+        // they keep a wake. Best-effort: the startup error is what surfaces.
+        await this.#serializeAlarmWrite(() =>
+          this.#jobDriver.armStartupFallback()
+        ).catch(() => {});
+      }
       throw error;
     }
     this.#deliverPendingEvents();
@@ -801,20 +820,25 @@ export class Lifecycle<
       return;
     }
 
-    const prior = this.#alarmRearmQueue;
-    const next = prior
-      .catch(() => {})
-      .then(async () => {
-        if (this.#alarmsDisabled) return;
-        const alarm = this.#jobQueue.nextAlarmTime(Date.now());
-        if (alarm === null) {
-          await this.#ctx.storage.deleteAlarm();
-        } else {
-          await this.#ctx.storage.setAlarm(alarm);
-        }
-      });
+    await this.#serializeAlarmWrite(async () => {
+      if (this.#alarmsDisabled) return;
+      const alarm = this.#jobQueue.nextAlarmTime(Date.now());
+      if (alarm === null) {
+        await this.#ctx.storage.deleteAlarm();
+      } else {
+        await this.#ctx.storage.setAlarm(alarm);
+      }
+    });
+  }
+
+  /**
+   * Run an alarm write after every earlier one settles, so a later
+   * calculation from fresher queue state always lands last.
+   */
+  #serializeAlarmWrite(write: () => Promise<void>): Promise<void> {
+    const next = this.#alarmRearmQueue.catch(() => {}).then(write);
     this.#alarmRearmQueue = next;
-    await next;
+    return next;
   }
 
   /**

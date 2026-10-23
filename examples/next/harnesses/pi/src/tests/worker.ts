@@ -107,7 +107,7 @@ export class PiHarnessTestObject extends DurableObject<Env> {
   });
   readonly registry = createRegistry();
   readonly harness = new PiHarness({
-    harness: async ({ storage, context }) => {
+    harness: async ({ storage, context, onWake }) => {
       this.registry.install(this.#testTools());
       this.registry.install({
         name: "workspace",
@@ -120,12 +120,9 @@ export class PiHarnessTestObject extends DurableObject<Env> {
         {
           models,
           registry: this.registry,
+          onWake,
           settings: {
-            retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
-            // No idle caches: their timers keep the object from being evicted,
-            // so evictDurableObject would wait on them.
-            contextRetentionMs: 0,
-            documentRetentionMs: 0
+            retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 }
           },
           onReport: (error) => console.warn("pi report", error)
         },
